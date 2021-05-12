@@ -1,0 +1,30 @@
+<?xml version="1.0"?>
+<ruleset
+    name="PHPMD Rule set"
+    xmlns="http://pmd.sf.net/ruleset/1.0.0"
+    xmlns:xsi="http://www.w3.org/2001/XMLSchema-instance"
+    xsi:schemaLocation="http://pmd.sf.net/ruleset/1.0.0 http://pmd.sf.net/ruleset_xml_schema.xsd"
+    xsi:noNamespaceSchemaLocation="http://pmd.sf.net/ruleset_xml_schema.xsd"
+>
+    <description>Rules for Flysystem IPFS</description>
+
+    <!-- Codesize rule set -->
+    <rule ref="rulesets/codesize.xml"/>
+
+    <!-- Naming rule set -->
+    <rule ref="rulesets/naming.xml"/>
+
+    <!-- Import the entire controversial rule set -->
+    <rule ref="rulesets/controversial.xml"/>
+
+    <!-- Import the entire design rule set -->
+    <rule ref="rulesets/design.xml"/>
+
+    <!-- Cleancode rule set -->
+    <rule ref="rulesets/cleancode.xml">
+        <exclude name="StaticAccess"/>
+        <exclude name="BooleanArgumentFlag"/>
+    </rule>
+
+    <exclude-pattern>tests/*.php</exclude-pattern>
+</ruleset>
