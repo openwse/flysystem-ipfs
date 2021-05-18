@@ -2,45 +2,64 @@
 
 namespace FlysystemIpfs;
 
-use Generator;
 use Ipfs\Ipfs;
 use Ipfs\IpfsException;
+use League\Flysystem\Adapter\AbstractAdapter;
+use League\Flysystem\Adapter\Polyfill\NotSupportingVisibilityTrait;
 use League\Flysystem\Config;
-use League\Flysystem\DirectoryAttributes;
-use League\Flysystem\FileAttributes;
-use League\Flysystem\FilesystemAdapter;
-use League\Flysystem\PathPrefixer;
-use League\Flysystem\UnableToCopyFile;
-use League\Flysystem\UnableToCreateDirectory;
-use League\Flysystem\UnableToDeleteDirectory;
-use League\Flysystem\UnableToDeleteFile;
-use League\Flysystem\UnableToMoveFile;
-use League\Flysystem\UnableToReadFile;
-use League\Flysystem\UnableToRetrieveMetadata;
-use League\Flysystem\UnableToSetVisibility;
-use League\Flysystem\UnableToWriteFile;
-use League\Flysystem\Visibility;
 use League\MimeTypeDetection\FinfoMimeTypeDetector;
-use League\MimeTypeDetection\MimeTypeDetector;
+use LogicException;
 
 /**
- * @SuppressWarnings(PHPMD.ExcessiveClassComplexity:)
- * @SuppressWarnings(PHPMD.CouplingBetweenObjects)
+ * @SuppressWarnings(PHPMD.ExcessiveClassComplexity)
  * @SuppressWarnings(PHPMD.TooManyPublicMethods)
  */
-class IpfsAdapter implements FilesystemAdapter
+class IpfsAdapter extends AbstractAdapter
 {
+    use NotSupportingVisibilityTrait;
+
     protected Ipfs $client;
 
-    protected PathPrefixer $prefixer;
+    protected array $config;
 
-    protected MimeTypeDetector $mimeTypeDetector;
-
-    public function __construct(Ipfs $client, string $prefix = '', MimeTypeDetector $mimeTypeDetector = null)
+    public function __construct(Ipfs $client, string $prefix = '', array $config = [])
     {
         $this->client = $client;
-        $this->prefixer = new PathPrefixer($prefix);
-        $this->mimeTypeDetector = $mimeTypeDetector ?: new FinfoMimeTypeDetector();
+        $this->setPathPrefix($prefix);
+        $this->config = array_replace_recursive([
+            // low-level local pin (without additional config)
+            // see: https://docs.ipfs.io/concepts/persistence/#pinning-in-context
+            'auto_pin' => true,
+            // you can configure a remote service for pinning, make sure you add it before
+            // see: https://docs.ipfs.io/how-to/work-with-pinning-services/#adding-a-new-pinning-service
+            'pin_options' => [
+                'remote' => false,
+                'service' => null,
+            ],
+            // add files/directories to the MFS
+            // see: https://docs.ipfs.io/concepts/file-systems/#mutable-file-system-mfs
+            'auto_copy' => true,
+            // auto_override will delete old file before adding a new one when calling rename or copy
+            // Note that there isn't true override for IPFS but you can use IPNS to solve that.
+            'auto_override' => true,
+            // InterPlanetary Name System
+            // see: https://docs.ipfs.io/concepts/ipns/#example-ipns-setup-with-cli
+            'auto_publish' => false,
+            'publish_options' => [
+                'lifetime' => '24h',
+                'offline' => false,
+                'allow_offline' => true,
+            ],
+            // resolve urls via configured gateway
+            // see: https://docs.ipfs.io/concepts/ipfs-gateway/#gateway-services
+            'gateway' => [
+                'service' => 'ipfs',
+                'style' => 'path',
+                'url' => GatewayResolver::DEFAULT_GATEWAY,
+                'domain' => null,
+                'prefer_domain' => false,
+            ],
+        ], $config);
     }
 
     public function getClient(): Ipfs
@@ -48,311 +67,409 @@ class IpfsAdapter implements FilesystemAdapter
         return $this->client;
     }
 
-    public function fileExists(string $path): bool
+    public function getConfig(): array
     {
-        $location = $this->applyPathPrefix($path);
+        return $this->config;
+    }
+
+    public function write($path, $contents, Config $config)
+    {
+        return $this->upload($path, $contents, $config);
+    }
+
+    public function writeStream($path, $resource, Config $config)
+    {
+        return $this->upload($path, $resource, $config);
+    }
+
+    public function update($path, $contents, Config $config)
+    {
+        return $this->upload($path, $contents, $config);
+    }
+
+    public function updateStream($path, $resource, Config $config)
+    {
+        return $this->upload($path, $resource, $config);
+    }
+
+    public function rename($path, $newpath): bool
+    {
+        $path = $this->applyPathPrefix($path);
+        $newPath = $this->applyPathPrefix($newpath);
 
         try {
-            $this->client->files()->stat($location);
-
-            return true;
+            $this->client->files()->mv($path, $newPath);
         } catch (IpfsException $exception) {
             return false;
         }
+
+        return true;
     }
 
-    public function write(string $path, string $contents, Config $config): void
+    public function copy($path, $newpath): bool
+    {
+        $path = $this->applyPathPrefix($path);
+        $newPath = $this->applyPathPrefix($newpath);
+
+        try {
+            if ($this->has($newPath)) {
+                $this->client->files()->rm($newPath);
+            }
+
+            $this->client->files()->cp($path, $newPath);
+        } catch (IpfsException $exception) {
+            return false;
+        }
+
+        return true;
+    }
+
+    public function delete($path): bool
     {
         $location = $this->applyPathPrefix($path);
 
         try {
-            $result = $this->client->add([
-                [$location, null, $contents],
-            ], $config->get('pin', false));
-
-            if ($this->fileExists($location) && ! $config->get('no_override', false)) {
-                $this->client->files()->rm($location);
-            }
-
-            if (! $config->get('no_copy', false)) {
-                $this->client->files()->mkdir(dirname($location), true);
-                $this->client->files()->cp('/ipfs/'.$result['Hash'], $location);
-            }
+            $this->client->files()->rm($location, true);
         } catch (IpfsException $exception) {
-            throw UnableToWriteFile::atLocation($location, $exception->getMessage(), $exception);
+            return false;
         }
+
+        return true;
     }
 
-    /**
-     * @param resource|string $contents
-     */
-    public function writeStream(string $path, $contents, Config $config): void
+    public function deleteDir($dirname): bool
     {
-        $location = $this->applyPathPrefix($path);
+        return $this->delete($dirname);
+    }
+
+    public function createDir($dirname, Config $config): bool
+    {
+        $location = $this->applyPathPrefix($dirname);
 
         try {
-            $result = $this->client->add([
-                [$location, null, $contents],
-            ], $config->get('pin', false));
-
-            if ($this->fileExists($location) && ! $config->get('no_override', false)) {
-                $this->client->files()->rm($location);
-            }
-
-            if (! $config->get('no_copy', false)) {
-                $this->client->files()->cp('/ipfs/'.$result['Hash'], $location);
-            }
+            $this->client->files()->mkdir($location, true);
         } catch (IpfsException $exception) {
-            throw UnableToWriteFile::atLocation($location, $exception->getMessage(), $exception);
+            return false;
         }
+
+        return true;
     }
 
-    public function read(string $path): string
+    public function has($path)
+    {
+        return $this->getMetadata($path);
+    }
+
+    public function read($path)
     {
         $location = $this->applyPathPrefix($path);
 
         try {
             $file = $this->client->files()->read($location);
         } catch (IpfsException $exception) {
-            throw UnableToReadFile::fromLocation($location, $exception->getMessage(), $exception);
+            return false;
         }
 
-        /* @phpstan-ignore-next-line */
-        return $file['Content'] ?? '';
+        return [
+            /* @phpstan-ignore-next-line */
+            'contents' => $file['Content'] ?? '',
+        ];
     }
 
-    public function readStream(string $path)
+    public function readStream($path)
     {
         $location = $this->applyPathPrefix($path);
 
         try {
             $stream = $this->client->files()->read($location, true);
         } catch (IpfsException $exception) {
-            throw UnableToReadFile::fromLocation($location, $exception->getMessage(), $exception);
+            return false;
         }
 
-        /* @phpstan-ignore-next-line */
-        return $stream;
+        return [
+            'stream' => $stream,
+        ];
     }
 
-    public function delete(string $path): void
+    public function listContents($directory = '', $recursive = false): array
     {
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            $this->client->files()->rm($location, true);
-        } catch (IpfsException $exception) {
-            throw UnableToDeleteFile::atLocation($location, $exception->getMessage(), $exception);
-        }
-    }
-
-    public function deleteDirectory(string $path): void
-    {
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            $this->client->files()->rm($location, true);
-        } catch (IpfsException $exception) {
-            throw UnableToDeleteDirectory::atLocation($location, $exception->getMessage(), $exception);
-        }
-    }
-
-    public function createDirectory(string $path, Config $config): void
-    {
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            $this->client->files()->mkdir($location, true);
-        } catch (IpfsException $exception) {
-            throw UnableToCreateDirectory::atLocation($location, $exception->getMessage());
-        }
-    }
-
-    public function setVisibility(string $path, string $visibility): void
-    {
-        // throw UnableToSetVisibility::atLocation($path, 'Adapter does not support visibility controls.');
-        $location = $this->applyPathPrefix($path);
-
-        if (! $this->fileExists($location)) {
-            throw new UnableToSetVisibility('File do not exists');
-        }
-    }
-
-    public function visibility(string $path): FileAttributes
-    {
-        $location = $this->applyPathPrefix($path);
-
-        if (! $this->fileExists($location)) {
-            throw UnableToRetrieveMetadata::visibility($location, 'File do not exists');
-        }
-
-        // Noop
-        return new FileAttributes(
-            $path,
-            null,
-            Visibility::PUBLIC,
-            time(),
-        );
-    }
-
-    public function mimeType(string $path): FileAttributes
-    {
-        $location = $this->applyPathPrefix($path);
-
-        if (! $this->fileExists($location)) {
-            throw UnableToRetrieveMetadata::mimeType($location, 'File do not exists.');
-        }
-
-        $mime = $this->mimeTypeDetector->detectMimeTypeFromPath($path);
-        if (is_null($mime)) {
-            throw UnableToRetrieveMetadata::mimeType($location, 'Unknown mimetype.');
-        }
-
-        return new FileAttributes(
-            $path,
-            null,
-            Visibility::PUBLIC,
-            time(),
-            $mime
-        );
-    }
-
-    public function lastModified(string $path): FileAttributes
-    {
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            $response = $this->client->files()->stat($location);
-        } catch (IpfsException $exception) {
-            throw UnableToRetrieveMetadata::lastModified($location, $exception->getMessage());
-        }
-
-        return new FileAttributes(
-            $path,
-            $response['Size'],
-            Visibility::PUBLIC,
-            time()
-        );
-    }
-
-    public function fileSize(string $path): FileAttributes
-    {
-        $location = $this->applyPathPrefix($path);
-
-        try {
-            $response = $this->client->files()->stat($location);
-            if ($response['Type'] === 'directory') {
-                throw UnableToRetrieveMetadata::fileSize($location, 'Path is a directory');
-            }
-        } catch (IpfsException $exception) {
-            throw UnableToRetrieveMetadata::fileSize($location, $exception->getMessage());
-        }
-
-        return new FileAttributes(
-            $path,
-            $response['Size'] ?? null,
-            Visibility::PUBLIC,
-            time()
-        );
-    }
-
-    public function listContents(string $path, bool $deep = false): iterable
-    {
-        foreach ($this->iterateFolderContents($path, $deep) as $entry) {
-            $storageAttrs = $this->normalizeResponse($path, $entry);
-
-            // Avoid including the base directory itself
-            if ($storageAttrs->isDir() && $storageAttrs->path() === $path) {
-                continue;
-            }
-
-            yield $storageAttrs;
-        }
-    }
-
-    protected function iterateFolderContents(string $path = '', bool $deep = false): Generator
-    {
-        $location = $this->applyPathPrefix($path);
+        $location = $this->applyPathPrefix($directory);
 
         try {
             $result = $this->client->files()->ls($location, true, true);
         } catch (IpfsException $exception) {
-            return;
+            return [];
         }
 
-        yield from $result['Entries'] ?? [];
+        $entries = array_map(function ($entry) use ($location) {
+            return $this->normalizeResponse($entry, $location);
+        }, $result['Entries'] ?? []);
 
-        if ($deep) {
-            foreach ($result['Entries'] ?? [] as $entry) {
-                if ($entry['Type'] === 1) {
-                    yield from $this->iterateFolderContents(
-                        trim($this->prefixer->stripDirectoryPrefix($entry['Name']), '/'),
-                        $deep
-                    );
+        if ($recursive) {
+            foreach ($entries as $entry) {
+                if ($entry['type'] === 'dir') {
+                    $entries = array_merge($entries, $this->listContents($entry['path'], $recursive));
                 }
             }
         }
+
+        return $entries;
+    }
+
+    public function getMetadata($path)
+    {
+        $location = $this->applyPathPrefix($path);
+
+        try {
+            $result = $this->client->files()->stat($location);
+            $result['Name'] = basename($location);
+        } catch (IpfsException $exception) {
+            return false;
+        }
+
+        return $this->normalizeResponse($result, dirname($location));
+    }
+
+    public function getSize($path)
+    {
+        $result = $this->getMetadata($path);
+        if (is_array($result) && $result['type'] === 'dir') {
+            return false;
+        }
+
+        return $result;
+    }
+
+    public function getMimetype($path)
+    {
+        if (! is_array($this->has($path))) {
+            return false;
+        }
+
+        $mimetype = (new FinfoMimeTypeDetector())->detectMimeTypeFromPath($path);
+        if (is_null($mimetype)) {
+            return false;
+        }
+
+        return ['mimetype' => $mimetype];
+    }
+
+    public function getTimestamp($path)
+    {
+        return $this->getMetadata($path);
     }
 
     /**
-     * @return DirectoryAttributes|FileAttributes
+     * @return false|string
      */
-    protected function normalizeResponse(string $path, array $response)
+    public function getTemporaryUrl(string $path, ?string $file = null, ?Config $config = null)
     {
-        if ($response['Type'] === 1) {
-            $normalizedPath = ltrim($path.'/'.$this->prefixer->stripDirectoryPrefix($response['Name']), '/');
-
-            return new DirectoryAttributes(
-                $normalizedPath,
-                Visibility::PUBLIC,
-                time(),
-            );
+        $attributes = $this->getMetadata($path);
+        if (! is_array($attributes)) {
+            return false;
         }
 
-        $normalizedPath = ltrim($path.'/'.$this->prefixer->stripPrefix($response['Name']), '/');
+        $parameters = $this->getMergedConfig($config);
 
-        return new FileAttributes(
-            $normalizedPath,
-            $response['Size'] ?? null,
-            Visibility::PUBLIC,
-            time(),
-            $this->mimeTypeDetector->detectMimeTypeFromPath($normalizedPath),
-            [
-                'hash' => $response['Hash'],
-            ]
+        $publishResult = $this->client->name()->publish(
+            '/ipfs/'.$attributes['hash'],
+            $parameters['publish_options']['lifetime'],
+            $this->getPublishKey($path, $file, $config),
+            $parameters['publish_options']['offline'],
+            $parameters['publish_options']['allow_offline']
         );
+
+        $resolver = new GatewayResolver('ipns', $parameters['gateway']['style'], [
+            'url' => $parameters['gateway']['url'],
+            'domain' => $parameters['gateway']['domain'],
+            'prefer_domain' => $parameters['gateway']['prefer_domain'],
+        ]);
+
+        return $resolver->resolve($path, $file, $attributes['hash'], $publishResult['Name']);
     }
 
-    public function move(string $source, string $destination, Config $config): void
+    /**
+     * @return false|string
+     */
+    public function getUrl(string $path, ?string $file = null)
     {
-        $path = $this->applyPathPrefix($source);
-        $newPath = $this->applyPathPrefix($destination);
-
-        try {
-            $this->client->files()->mv($path, $newPath);
-        } catch (IpfsException $exception) {
-            throw UnableToMoveFile::fromLocationTo($path, $newPath, $exception);
+        $attributes = $this->getMetadata($path);
+        if (! is_array($attributes)) {
+            return false;
         }
+
+        $url = sprintf('ipfs://ipfs/%1$s', $attributes['hash']);
+
+        if (! is_null($file)) {
+            $fileLocation = $this->applyPathPrefix($path).'/'.trim($file, '/');
+            $fileExists = $this->has($fileLocation);
+            if (is_array($fileExists) && $fileExists['type'] === 'file') {
+                $url .= '/'.trim($file, '/');
+            }
+        }
+
+        return $url;
     }
 
-    public function copy(string $source, string $destination, Config $config): void
+    /**
+     * @see https://docs.ipfs.io/concepts/ipfs-gateway/#gateway-services
+     *
+     * @return false|string
+     */
+    public function getGatewayUrl(string $path, ?string $file = null, ?Config $config = null)
     {
-        $path = $this->applyPathPrefix($source);
-        $newPath = $this->applyPathPrefix($destination);
+        $attributes = $this->getMetadata($path);
+        if (! is_array($attributes)) {
+            return false;
+        }
 
-        try {
-            if ($this->fileExists($newPath) && ! $config->get('no_override', false)) {
-                $this->client->files()->rm($newPath);
+        $parameters = $this->getMergedConfig($config);
+        $resolver = new GatewayResolver($parameters['gateway']['service'], $parameters['gateway']['style'], [
+            'url' => $parameters['gateway']['url'],
+            'domain' => $parameters['gateway']['domain'],
+            'prefer_domain' => $parameters['gateway']['prefer_domain'],
+        ]);
+
+        $ipns = $parameters['ipns'];
+        if ($resolver->getService() === 'ipns' && in_array($resolver->getStyle(), ['path', 'subdomain']) && is_null($ipns)) {
+            if ($parameters['auto_publish'] !== true) {
+                throw new LogicException(get_class($this).' an IPNS is required to resolve this service/style of gateway. Either auto_publish or provide an IPNS in the Config.');
             }
 
-            $this->client->files()->cp($path, $newPath);
-        } catch (IpfsException $exception) {
-            throw UnableToCopyFile::fromLocationTo($path, $newPath, $exception);
+            $result = $this->client->name()->publish(
+                '/ipfs/'.$attributes['hash'],
+                $parameters['publish_options']['lifetime'],
+                $this->getPublishKey($path, uniqid(), $config),
+                $parameters['publish_options']['offline'],
+                $parameters['publish_options']['allow_offline']
+            );
+            $ipns = $result['Name'];
         }
+
+        return $resolver->resolve($path, $file, $attributes['hash'], $ipns);
     }
 
-    protected function applyPathPrefix(string $path): string
+    /**
+     * @SuppressWarnings(PHPMD.CyclomaticComplexity)
+     *
+     * @param string|resource $contents
+     *
+     * @return array|false
+     */
+    protected function upload(string $path, $contents, Config $config)
     {
-        return '/'.trim($this->prefixer->prefixPath($path), '/');
+        $location = $this->applyPathPrefix($path);
+
+        $parameters = $this->getMergedConfig($config);
+
+        try {
+            $remotePinning = isset($parameters['pin_options']['remote'])
+                && isset($parameters['pin_options']['service'])
+                && $parameters['pin_options']['remote'] === true
+                && ! empty($parameters['pin_options']['service'])
+            ;
+            $result = $this->client->add([[$location, null, $contents]], $parameters['auto_pin'] === true && ! $remotePinning);
+            if ($parameters['auto_pin'] === true && $remotePinning) {
+                $this->client->pin()->remote($parameters['pin_options']['service'])
+                    ->add($result['Hash'])
+                ;
+            }
+
+            if ($parameters['auto_copy'] === true) {
+                if ($this->has($location) && $parameters['auto_override'] === true) {
+                    $this->client->files()->rm($location);
+                }
+
+                $this->client->files()->mkdir(dirname($location), true);
+                $this->client->files()->cp('/ipfs/'.$result['Hash'], $location);
+            }
+
+            if ($parameters['auto_publish'] === true) {
+                $this->client->name()->publish(
+                    '/ipfs/'.$result['hash'],
+                    $parameters['publish_options']['lifetime'],
+                    $this->getPublishKey($path, uniqid(), $config),
+                    $parameters['publish_options']['offline'],
+                    $parameters['publish_options']['allow_offline']
+                );
+            }
+        } catch (IpfsException $exception) {
+            return false;
+        }
+
+        return $this->normalizeResponse($result);
+    }
+
+    /**
+     * @SuppressWarnings(PHPMD.ElseExpression)
+     */
+    protected function normalizeResponse(array $response, string $path = ''): array
+    {
+        $normalizedPath = ltrim($this->removePathPrefix(trim($path, '/').'/'.$response['Name']), '/');
+
+        $normalizedResponse = [
+            'path' => $normalizedPath,
+            'hash' => $response['Hash'],
+            'timestamp' => time(),
+        ];
+
+        if (isset($response['Size'])) {
+            $normalizedResponse['size'] = $response['Size'];
+        }
+
+        if (is_int($response['Type'])) {
+            $type = ($response['Type'] === 1) ? 'dir' : 'file';
+        } else {
+            $type = ($response['Type'] === 'directory') ? 'dir' : 'file';
+        }
+        $normalizedResponse['type'] = $type;
+
+        return $normalizedResponse;
+    }
+
+    private function getPublishKey(string $path, ?string $file = null, ?Config $config = null): string
+    {
+        $key = is_null($config) ? null : $config->get('key');
+        if (is_null($key)) {
+            $fullPath = $this->applyPathPrefix($path).'/'.trim($file ?? '', '/');
+            /* @phpstan-ignore-next-line */
+            $key = strtolower(trim(preg_replace('/[^A-Za-z0-9-]+/', '', $fullPath)));
+            $this->client->key()->gen($key);
+        }
+
+        return $key;
+    }
+
+    private function getMergedConfig(?Config $config = null): array
+    {
+        $parameters = $this->config;
+
+        if (! is_null($config)) {
+            foreach ($parameters as $key => $parameter) {
+                if ($config->has($key)) {
+                    if (is_array($parameter)) {
+                        $subConfig = $config->get($key);
+                        foreach ($parameter as $k => $v) {
+                            if (isset($subConfig[$k])) {
+                                $parameters[$key][$k] = $subConfig[$k];
+                            }
+                        }
+
+                        continue;
+                    }
+
+                    $parameters[$key] = $config->get($key);
+                }
+            }
+        }
+
+        return $parameters;
+    }
+
+    public function applyPathPrefix($path): string
+    {
+        $path = parent::applyPathPrefix($path);
+
+        return '/'.trim($path, '/');
     }
 }

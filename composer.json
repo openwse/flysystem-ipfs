@@ -15,14 +15,29 @@
     ],
     "homepage": "https://github.com/openwse/flysystem-ipfs",
     "license": "MIT",
+    "repositories": [
+        {
+            "type": "package",
+            "package": {
+                "name": "openwse/flysystem-adapter-test-utilities",
+                "version": "1.0.0",
+                "source": {
+                    "url": "https://github.com/openwse/flysystem-adapter-test-utilities.git",
+                    "type": "git",
+                    "reference": "1.x"
+                }
+            }
+        }
+
+    ],
     "require": {
         "php": "^7.4",
-        "league/flysystem": "^2.0",
-        "openwse/ipfs-api": "^0.1"
+        "league/flysystem": "^1.1",
+        "openwse/ipfs-api": "^0.1.4"
     },
     "require-dev": {
         "friendsofphp/php-cs-fixer": "^2.18",
-        "league/flysystem-adapter-test-utilities": "^2.0",
+        "openwse/flysystem-adapter-test-utilities": "^1.0",
         "php-parallel-lint/php-parallel-lint": "^1.3",
         "phpmd/phpmd": "^2.9",
         "phpstan/phpstan": "^0.12.83",
@@ -41,8 +56,12 @@
     },
     "autoload-dev": {
         "psr-4": {
+            "League\\Flysystem\\AdapterTestUtilities\\": "vendor/openwse/flysystem-adapter-test-utilities",
             "FlysystemIpfs\\Tests\\": "tests"
-        }
+        },
+        "files": [
+            "vendor/openwse/flysystem-adapter-test-utilities/test-functions.php"
+        ]
     },
     "minimum-stability": "dev",
     "prefer-stable": true,
