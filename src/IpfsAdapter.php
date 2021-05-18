@@ -368,7 +368,7 @@ class IpfsAdapter extends AbstractAdapter
                 && $parameters['pin_options']['remote'] === true
                 && ! empty($parameters['pin_options']['service'])
             ;
-            $result = $this->client->add([[$location, null, $contents]], $parameters['auto_pin'] === true && ! $remotePinning);
+            $result = $this->client->add([[$location, null, $contents, null]], $parameters['auto_pin'] === true && ! $remotePinning);
             if ($parameters['auto_pin'] === true && $remotePinning) {
                 $this->client->pin()->remote($parameters['pin_options']['service'])
                     ->add($result['Hash'])
@@ -417,12 +417,14 @@ class IpfsAdapter extends AbstractAdapter
             $normalizedResponse['size'] = $response['Size'];
         }
 
-        if (is_int($response['Type'])) {
-            $type = ($response['Type'] === 1) ? 'dir' : 'file';
-        } else {
-            $type = ($response['Type'] === 'directory') ? 'dir' : 'file';
+        if (isset($response['Type'])) {
+            if (is_int($response['Type'])) {
+                $type = ($response['Type'] === 1) ? 'dir' : 'file';
+            } else {
+                $type = ($response['Type'] === 'directory') ? 'dir' : 'file';
+            }
+            $normalizedResponse['type'] = $type;
         }
-        $normalizedResponse['type'] = $type;
 
         return $normalizedResponse;
     }

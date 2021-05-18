@@ -47,6 +47,9 @@ It uses [tests cases provided by Flysystem](https://flysystem.thephpleague.com/v
 composer tests
 ```
 
+## TODOS
+- Better url support (following url() of FlysystemAdapter interface)
+
 
 ## License
 
